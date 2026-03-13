@@ -61,7 +61,7 @@ dotnet test -c Release
 
 ## Acknowledgements
 
-[Hoshidicts](https://github.com/Manhhao/hoshidicts/tree/main-mit) original C++ version | MIT
-[Yomitan](https://github.com/yomidevs/yomitan) dictionary format | GPLv3
-[K4os.Compression.LZ4](https://github.com/MiloszKrajewski/K4os.Compression.LZ4) high-performance LZ4 compression library | MIT
-[Jiten](https://github.com/Sirush/Jiten) deconjugator | Apache-2.0
+- [Hoshidicts](https://github.com/Manhhao/hoshidicts/tree/main-mit) original C++ version | MIT
+- [Yomitan](https://github.com/yomidevs/yomitan) dictionary format | GPLv3
+- [K4os.Compression.LZ4](https://github.com/MiloszKrajewski/K4os.Compression.LZ4) high-performance LZ4 compression library | MIT
+- [Jiten](https://github.com/Sirush/Jiten) deconjugator | Apache-2.0
