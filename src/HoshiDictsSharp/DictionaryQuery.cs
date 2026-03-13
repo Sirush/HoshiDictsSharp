@@ -145,7 +145,11 @@ public sealed class DictionaryQuery
     public List<TermResult> Query(string expression)
     {
         var termMap = new Dictionary<(string, string), TermResult>();
-        byte[] exprBytes = Encoding.UTF8.GetBytes(expression);
+
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(expression.Length);
+        Span<byte> exprBuf = maxBytes <= 256 ? stackalloc byte[maxBytes] : new byte[maxBytes];
+        int bytesWritten = Encoding.UTF8.GetBytes(expression.AsSpan(), exprBuf);
+        var exprBytes = exprBuf[..bytesWritten];
 
         foreach (var dict in _termDicts)
         {
@@ -158,12 +162,12 @@ public sealed class DictionaryQuery
         }
 
         var results = termMap.Values.ToList();
-        QueryFreq(results);
-        QueryPitch(results);
+        if (_freqDicts.Count > 0) QueryFreq(results);
+        if (_pitchDicts.Count > 0) QueryPitch(results);
         return results;
     }
 
-    private static void ReadEntries(LoadedDict dict, ulong offsetAddr, string expression, byte[] exprBytes,
+    private static void ReadEntries(LoadedDict dict, ulong offsetAddr, string expression, ReadOnlySpan<byte> exprBytes,
         Dictionary<(string, string), TermResult> termMap)
     {
         int pos = (int)offsetAddr;

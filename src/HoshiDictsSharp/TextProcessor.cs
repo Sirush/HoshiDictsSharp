@@ -69,16 +69,36 @@ public static class TextProcessor
 
     public static List<TextVariant> Process(string src)
     {
+        bool hasConvertibleKatakana = false, hasHiragana = false;
+        foreach (char c in src)
+        {
+            if ((c >= KatakanaStart && c <= KatakanaEnd && c != KatakanaSmallKa && c != KatakanaSmallKe) || c == ProlongedSoundMark)
+                hasConvertibleKatakana = true;
+            else if (c >= HiraganaStart && c <= HiraganaEnd)
+                hasHiragana = true;
+
+            if (hasConvertibleKatakana && hasHiragana) break;
+        }
+
+        if (!hasConvertibleKatakana && !hasHiragana)
+            return [new(src, 0)];
+
         var result = new List<TextVariant>(3) { new(src, 0) };
 
-        string hiragana = ToHiragana(src);
-        string katakana = ToKatakana(src);
+        string? hiragana = null;
+        if (hasConvertibleKatakana)
+        {
+            hiragana = ToHiragana(src);
+            if (hiragana != src)
+                result.Add(new(hiragana, 1));
+        }
 
-        if (hiragana != src)
-            result.Add(new(hiragana, 1));
-
-        if (katakana != src && katakana != hiragana)
-            result.Add(new(katakana, 1));
+        if (hasHiragana)
+        {
+            string katakana = ToKatakana(src);
+            if (katakana != src && katakana != (hiragana ?? src))
+                result.Add(new(katakana, 1));
+        }
 
         return result;
     }

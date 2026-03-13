@@ -36,6 +36,8 @@ public sealed class LookupEngine
         while (enumerator.MoveNext())
             positions.Add(enumerator.ElementIndex + enumerator.GetTextElement().Length);
 
+        var deduplicated = new Dictionary<(string, string), DeconjugationForm>();
+
         for (int i = start; i > 0; i--)
         {
             if (i >= positions.Count) continue;
@@ -47,7 +49,7 @@ public sealed class LookupEngine
             {
                 var forms = _deconjugator.Deconjugate(variant.Text);
 
-                var deduplicated = new Dictionary<(string, string), DeconjugationForm>();
+                deduplicated.Clear();
                 foreach (var form in forms)
                 {
                     string lastTag = form.Tags.Count > 0 ? form.Tags[^1] : "";
@@ -109,12 +111,27 @@ public sealed class LookupEngine
         if (form.Tags.Count == 0) return;
 
         string tag = form.Tags[^1];
-        terms.RemoveAll(term =>
+        for (int i = terms.Count - 1; i >= 0; i--)
         {
-            if (string.IsNullOrEmpty(term.Rules)) return true;
-            var posTags = term.Rules.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            return !posTags.Any(p => p == tag || tag.StartsWith(p, StringComparison.Ordinal));
-        });
+            if (!MatchesPos(terms[i].Rules, tag))
+                terms.RemoveAt(i);
+        }
+    }
+
+    private static bool MatchesPos(string rules, string tag)
+    {
+        if (string.IsNullOrEmpty(rules)) return false;
+        var rulesSpan = rules.AsSpan();
+        var tagSpan = tag.AsSpan();
+        while (rulesSpan.Length > 0)
+        {
+            int spaceIdx = rulesSpan.IndexOf(' ');
+            ReadOnlySpan<char> p = spaceIdx < 0 ? rulesSpan : rulesSpan[..spaceIdx];
+            if (p.Length > 0 && (p.SequenceEqual(tagSpan) || tagSpan.StartsWith(p)))
+                return true;
+            rulesSpan = spaceIdx < 0 ? default : rulesSpan[(spaceIdx + 1)..];
+        }
+        return false;
     }
 
     private static int GetFreqValueForDict(TermResult term, string dictName)
