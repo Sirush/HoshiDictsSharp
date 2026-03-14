@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -22,19 +24,39 @@ public sealed class TermResult
     public List<PitchEntry> Pitches = [];
 }
 
-public sealed class DictionaryQuery
+public sealed class DictionaryQuery : IDisposable
 {
-    private sealed class LoadedDict
+    private struct GlossaryBlock
+    {
+        public long CumulativeRawOffset;
+        public int CompressedDataOffset;
+        public int CompressedSize;
+        public int UncompressedSize;
+    }
+
+    private sealed class LoadedDict : IDisposable
     {
         public string Name = "";
         public string? Styles;
         public Mphf Phf = new();
         public byte[] Blobs = [];
         public ulong[] Offsets = [];
-        public byte[] DecompressedGlossary = [];
+        public GlossaryBlock[] GlossaryBlocks = [];
         public ulong EntryDataOffset;
-        public byte[]? Media;
+        public MemoryMappedFile? MediaMmf;
+        public MemoryMappedViewAccessor? MediaAccessor;
+        public long MediaLength;
         public Dictionary<string, (uint Size, uint Offset)>? MediaIndex;
+
+        public const int BlockCacheCapacity = 64;
+        public readonly Dictionary<int, byte[]> BlockCache = new(BlockCacheCapacity);
+        public readonly Queue<int> BlockCacheOrder = new(BlockCacheCapacity);
+
+        public void Dispose()
+        {
+            MediaAccessor?.Dispose();
+            MediaMmf?.Dispose();
+        }
     }
 
     private readonly List<LoadedDict> _termDicts = [];
@@ -67,26 +89,32 @@ public sealed class DictionaryQuery
         dict.Offsets = MemoryMarshal.Cast<byte, ulong>(offsetBytes.AsSpan()).ToArray();
 
         dict.Blobs = File.ReadAllBytes(Path.Combine(path, "blobs.bin"));
-        DecompressGlossarySection(dict);
+        BuildGlossaryBlockIndex(dict);
 
         string mediaPath = Path.Combine(path, "media.bin");
         if (File.Exists(mediaPath))
         {
-            dict.Media = File.ReadAllBytes(mediaPath);
-            dict.MediaIndex = BuildMediaIndex(dict.Media);
+            var fi = new FileInfo(mediaPath);
+            if (fi.Length > 0)
+            {
+                dict.MediaLength = fi.Length;
+                dict.MediaMmf = MemoryMappedFile.CreateFromFile(mediaPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+                dict.MediaAccessor = dict.MediaMmf.CreateViewAccessor(0, fi.Length, MemoryMappedFileAccess.Read);
+                dict.MediaIndex = BuildMediaIndex(dict.MediaAccessor, fi.Length);
+            }
         }
 
         target.Add(dict);
     }
 
-    private static void DecompressGlossarySection(LoadedDict dict)
+    private static void BuildGlossaryBlockIndex(LoadedDict dict)
     {
         if (dict.Blobs.Length < 8) return;
 
         ulong totalCompressedSize = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs);
         if (totalCompressedSize == 0)
         {
-            dict.DecompressedGlossary = [];
+            dict.GlossaryBlocks = [];
             dict.EntryDataOffset = 8;
             return;
         }
@@ -94,50 +122,118 @@ public sealed class DictionaryQuery
         int pos = 8;
         int end = 8 + (int)totalCompressedSize;
 
-        int totalDecompressed = 0;
-        int scanPos = pos;
-        while (scanPos < end)
-        {
-            int uncompSize = BinaryPrimitives.ReadInt32LittleEndian(dict.Blobs.AsSpan(scanPos));
-            int compSize = BinaryPrimitives.ReadInt32LittleEndian(dict.Blobs.AsSpan(scanPos + 4));
-            totalDecompressed += uncompSize;
-            scanPos += 8 + compSize;
-        }
-
-        dict.DecompressedGlossary = new byte[totalDecompressed];
-        int decompPos = 0;
-
+        var blocks = new List<GlossaryBlock>();
+        long cumulativeRaw = 0;
         while (pos < end)
         {
             int uncompSize = BinaryPrimitives.ReadInt32LittleEndian(dict.Blobs.AsSpan(pos));
             int compSize = BinaryPrimitives.ReadInt32LittleEndian(dict.Blobs.AsSpan(pos + 4));
-            pos += 8;
-
-            LZ4Codec.Decode(
-                dict.Blobs.AsSpan(pos, compSize),
-                dict.DecompressedGlossary.AsSpan(decompPos, uncompSize));
-
-            decompPos += uncompSize;
-            pos += compSize;
+            blocks.Add(new GlossaryBlock
+            {
+                CumulativeRawOffset = cumulativeRaw,
+                CompressedDataOffset = pos + 8,
+                CompressedSize = compSize,
+                UncompressedSize = uncompSize
+            });
+            cumulativeRaw += uncompSize;
+            pos += 8 + compSize;
         }
 
+        dict.GlossaryBlocks = blocks.ToArray();
         dict.EntryDataOffset = (ulong)end;
     }
 
-    private static Dictionary<string, (uint Size, uint Offset)> BuildMediaIndex(byte[] media)
+    private static string DecompressGlossary(LoadedDict dict, ulong glossaryOffset, uint glossaryRawSize)
+    {
+        if (glossaryRawSize == 0 || dict.GlossaryBlocks.Length == 0)
+            return "";
+
+        var blocks = dict.GlossaryBlocks;
+        int blockIdx = FindGlossaryBlock(blocks, (long)glossaryOffset);
+        if (blockIdx < 0) return "";
+
+        ref var block = ref blocks[blockIdx];
+        int offsetInBlock = (int)((long)glossaryOffset - block.CumulativeRawOffset);
+
+        byte[] buf = GetOrDecompressBlock(dict, blockIdx);
+
+        if (offsetInBlock + (int)glossaryRawSize <= block.UncompressedSize)
+            return Encoding.UTF8.GetString(buf, offsetInBlock, (int)glossaryRawSize);
+
+        int firstPartLen = block.UncompressedSize - offsetInBlock;
+        int remaining = (int)glossaryRawSize - firstPartLen;
+        byte[] result = new byte[glossaryRawSize];
+        Buffer.BlockCopy(buf, offsetInBlock, result, 0, firstPartLen);
+
+        int resultPos = firstPartLen;
+        int nextBlock = blockIdx + 1;
+        while (remaining > 0 && nextBlock < blocks.Length)
+        {
+            byte[] nbBuf = GetOrDecompressBlock(dict, nextBlock);
+            ref var nb = ref blocks[nextBlock];
+            int toCopy = Math.Min(remaining, nb.UncompressedSize);
+            Buffer.BlockCopy(nbBuf, 0, result, resultPos, toCopy);
+            resultPos += toCopy;
+            remaining -= toCopy;
+            nextBlock++;
+        }
+
+        return Encoding.UTF8.GetString(result);
+    }
+
+    private static byte[] GetOrDecompressBlock(LoadedDict dict, int blockIdx)
+    {
+        if (dict.BlockCache.TryGetValue(blockIdx, out byte[]? cached))
+            return cached;
+
+        ref var block = ref dict.GlossaryBlocks[blockIdx];
+        byte[] buf = new byte[block.UncompressedSize];
+        LZ4Codec.Decode(
+            dict.Blobs.AsSpan(block.CompressedDataOffset, block.CompressedSize),
+            buf.AsSpan(0, block.UncompressedSize));
+
+        if (dict.BlockCache.Count >= LoadedDict.BlockCacheCapacity)
+        {
+            int evict = dict.BlockCacheOrder.Dequeue();
+            dict.BlockCache.Remove(evict);
+        }
+        dict.BlockCache[blockIdx] = buf;
+        dict.BlockCacheOrder.Enqueue(blockIdx);
+        return buf;
+    }
+
+    private static int FindGlossaryBlock(GlossaryBlock[] blocks, long rawOffset)
+    {
+        int lo = 0, hi = blocks.Length - 1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) >> 1);
+            long blockStart = blocks[mid].CumulativeRawOffset;
+            long blockEnd = blockStart + blocks[mid].UncompressedSize;
+            if (rawOffset < blockStart) hi = mid - 1;
+            else if (rawOffset >= blockEnd) lo = mid + 1;
+            else return mid;
+        }
+        return -1;
+    }
+
+    private static Dictionary<string, (uint Size, uint Offset)> BuildMediaIndex(MemoryMappedViewAccessor accessor, long length)
     {
         var index = new Dictionary<string, (uint, uint)>();
-        int pos = 0;
-        while (pos < media.Length)
+        long pos = 0;
+        byte[] pathBuf = new byte[512];
+        while (pos < length)
         {
-            ushort pathLen = BinaryPrimitives.ReadUInt16LittleEndian(media.AsSpan(pos));
+            ushort pathLen = accessor.ReadUInt16(pos);
             pos += 2;
-            string mediaPath = Encoding.UTF8.GetString(media, pos, pathLen);
+            byte[] pathBytes = pathLen <= 512 ? pathBuf : new byte[pathLen];
+            accessor.ReadArray(pos, pathBytes, 0, pathLen);
+            string mediaPath = Encoding.UTF8.GetString(pathBytes, 0, pathLen);
             pos += pathLen;
-            uint blobLen = BinaryPrimitives.ReadUInt32LittleEndian(media.AsSpan(pos));
+            uint blobLen = accessor.ReadUInt32(pos);
             pos += 4;
             index[mediaPath] = (blobLen, (uint)pos);
-            pos += (int)blobLen;
+            pos += blobLen;
         }
         return index;
     }
@@ -214,9 +310,7 @@ public sealed class DictionaryQuery
             uint glossaryRawSize = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(ep));
             ep += 4;
 
-            string glossary = "";
-            if (glossaryRawSize > 0 && glossaryOffset + glossaryRawSize <= (ulong)dict.DecompressedGlossary.Length)
-                glossary = Encoding.UTF8.GetString(dict.DecompressedGlossary, (int)glossaryOffset, (int)glossaryRawSize);
+            string glossary = DecompressGlossary(dict, glossaryOffset, glossaryRawSize);
 
             byte defTagsLen = dict.Blobs[ep++];
             string defTags = Encoding.UTF8.GetString(dict.Blobs, ep, defTagsLen);
@@ -512,13 +606,13 @@ public sealed class DictionaryQuery
     {
         foreach (var dict in _termDicts)
         {
-            if (dict.Name != dictName || dict.MediaIndex == null || dict.Media == null)
+            if (dict.Name != dictName || dict.MediaIndex == null || dict.MediaAccessor == null)
                 continue;
 
             if (dict.MediaIndex.TryGetValue(mediaPath, out var entry))
             {
                 var result = new byte[entry.Size];
-                Array.Copy(dict.Media, entry.Offset, result, 0, entry.Size);
+                dict.MediaAccessor.ReadArray(entry.Offset, result, 0, (int)entry.Size);
                 return result;
             }
         }
@@ -536,5 +630,12 @@ public sealed class DictionaryQuery
     public List<string> GetFreqDictOrder()
     {
         return _freqDicts.Select(d => d.Name).ToList();
+    }
+
+    public void Dispose()
+    {
+        foreach (var dict in _termDicts) dict.Dispose();
+        foreach (var dict in _freqDicts) dict.Dispose();
+        foreach (var dict in _pitchDicts) dict.Dispose();
     }
 }
