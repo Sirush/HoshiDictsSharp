@@ -24,7 +24,7 @@ public sealed class TermResult
     public List<PitchEntry> Pitches = [];
 }
 
-public sealed class DictionaryQuery : IDisposable
+public sealed unsafe class DictionaryQuery : IDisposable
 {
     private struct GlossaryBlock
     {
@@ -34,12 +34,15 @@ public sealed class DictionaryQuery : IDisposable
         public int UncompressedSize;
     }
 
-    private sealed class LoadedDict : IDisposable
+    private sealed unsafe class LoadedDict : IDisposable
     {
         public string Name = "";
         public string? Styles;
         public Mphf Phf = new();
-        public byte[] Blobs = [];
+        public byte* BlobsPtr;
+        public long BlobsLength;
+        public MemoryMappedFile? BlobsMmf;
+        public MemoryMappedViewAccessor? BlobsAccessor;
         public ulong[] Offsets = [];
         public GlossaryBlock[] GlossaryBlocks = [];
         public ulong EntryDataOffset;
@@ -52,8 +55,13 @@ public sealed class DictionaryQuery : IDisposable
         public readonly Dictionary<int, byte[]> BlockCache = new(BlockCacheCapacity);
         public readonly Queue<int> BlockCacheOrder = new(BlockCacheCapacity);
 
+        public ReadOnlySpan<byte> BlobSpan(int offset, int length) => new(BlobsPtr + offset, length);
+
         public void Dispose()
         {
+            BlobsAccessor?.SafeMemoryMappedViewHandle.ReleasePointer();
+            BlobsAccessor?.Dispose();
+            BlobsMmf?.Dispose();
             MediaAccessor?.Dispose();
             MediaMmf?.Dispose();
         }
@@ -88,7 +96,17 @@ public sealed class DictionaryQuery : IDisposable
         byte[] offsetBytes = File.ReadAllBytes(Path.Combine(path, "offsets.bin"));
         dict.Offsets = MemoryMarshal.Cast<byte, ulong>(offsetBytes.AsSpan()).ToArray();
 
-        dict.Blobs = File.ReadAllBytes(Path.Combine(path, "blobs.bin"));
+        string blobsPath = Path.Combine(path, "blobs.bin");
+        var blobsFi = new FileInfo(blobsPath);
+        if (blobsFi.Length > 0)
+        {
+            dict.BlobsLength = blobsFi.Length;
+            dict.BlobsMmf = MemoryMappedFile.CreateFromFile(blobsPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            dict.BlobsAccessor = dict.BlobsMmf.CreateViewAccessor(0, blobsFi.Length, MemoryMappedFileAccess.Read);
+            byte* ptr = null;
+            dict.BlobsAccessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+            dict.BlobsPtr = ptr + dict.BlobsAccessor.PointerOffset;
+        }
         BuildGlossaryBlockIndex(dict);
 
         string mediaPath = Path.Combine(path, "media.bin");
@@ -109,9 +127,9 @@ public sealed class DictionaryQuery : IDisposable
 
     private static void BuildGlossaryBlockIndex(LoadedDict dict)
     {
-        if (dict.Blobs.Length < 8) return;
+        if (dict.BlobsLength < 8) return;
 
-        ulong totalCompressedSize = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs);
+        ulong totalCompressedSize = BinaryPrimitives.ReadUInt64LittleEndian(dict.BlobSpan(0, 8));
         if (totalCompressedSize == 0)
         {
             dict.GlossaryBlocks = [];
@@ -126,8 +144,8 @@ public sealed class DictionaryQuery : IDisposable
         long cumulativeRaw = 0;
         while (pos < end)
         {
-            int uncompSize = BinaryPrimitives.ReadInt32LittleEndian(dict.Blobs.AsSpan(pos));
-            int compSize = BinaryPrimitives.ReadInt32LittleEndian(dict.Blobs.AsSpan(pos + 4));
+            int uncompSize = BinaryPrimitives.ReadInt32LittleEndian(dict.BlobSpan(pos, 4));
+            int compSize = BinaryPrimitives.ReadInt32LittleEndian(dict.BlobSpan(pos + 4, 4));
             blocks.Add(new GlossaryBlock
             {
                 CumulativeRawOffset = cumulativeRaw,
@@ -189,7 +207,7 @@ public sealed class DictionaryQuery : IDisposable
         ref var block = ref dict.GlossaryBlocks[blockIdx];
         byte[] buf = new byte[block.UncompressedSize];
         LZ4Codec.Decode(
-            dict.Blobs.AsSpan(block.CompressedDataOffset, block.CompressedSize),
+            dict.BlobSpan(block.CompressedDataOffset, block.CompressedSize),
             buf.AsSpan(0, block.UncompressedSize));
 
         if (dict.BlockCache.Count >= LoadedDict.BlockCacheCapacity)
@@ -252,7 +270,7 @@ public sealed class DictionaryQuery : IDisposable
             ulong hash = dict.Phf.Lookup(exprBytes);
             if (hash >= (ulong)dict.Offsets.Length) continue;
             ulong offsetAddr = dict.Offsets[hash];
-            if (offsetAddr >= (ulong)dict.Blobs.Length) continue;
+            if (offsetAddr >= (ulong)dict.BlobsLength) continue;
 
             ReadEntries(dict, offsetAddr, expression, exprBytes, termMap);
         }
@@ -267,7 +285,7 @@ public sealed class DictionaryQuery : IDisposable
         Dictionary<(string, string), TermResult> termMap)
     {
         int pos = (int)offsetAddr;
-        uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(pos));
+        uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.BlobSpan(pos, 4));
         pos += 4;
 
         ulong prevPairHash = 0;
@@ -276,21 +294,21 @@ public sealed class DictionaryQuery : IDisposable
 
         for (uint i = 0; i < count; i++)
         {
-            ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(pos));
+            ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.BlobSpan(pos, 8));
             pos += 8;
 
             int ep = (int)entryOffset;
-            byte type = dict.Blobs[ep++];
+            byte type = dict.BlobsPtr[ep++];
             if (type != 0) continue;
 
-            ushort exprLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.Blobs.AsSpan(ep));
+            ushort exprLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.BlobSpan(ep, 2));
             ep += 2;
-            var exprSpan = dict.Blobs.AsSpan(ep, exprLen);
+            var exprSpan = dict.BlobSpan(ep, exprLen);
             ep += exprLen;
 
-            ushort readingLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.Blobs.AsSpan(ep));
+            ushort readingLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.BlobSpan(ep, 2));
             ep += 2;
-            var readingSpan = dict.Blobs.AsSpan(ep, readingLen);
+            var readingSpan = dict.BlobSpan(ep, readingLen);
             ep += readingLen;
 
             bool exprMatch = exprSpan.SequenceEqual(exprBytes);
@@ -305,23 +323,23 @@ public sealed class DictionaryQuery : IDisposable
                 prevPairHash = pairHash;
             }
 
-            ulong glossaryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(ep));
+            ulong glossaryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.BlobSpan(ep, 8));
             ep += 8;
-            uint glossaryRawSize = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(ep));
+            uint glossaryRawSize = BinaryPrimitives.ReadUInt32LittleEndian(dict.BlobSpan(ep, 4));
             ep += 4;
 
             string glossary = DecompressGlossary(dict, glossaryOffset, glossaryRawSize);
 
-            byte defTagsLen = dict.Blobs[ep++];
-            string defTags = Encoding.UTF8.GetString(dict.Blobs, ep, defTagsLen);
+            byte defTagsLen = dict.BlobsPtr[ep++];
+            string defTags = Encoding.UTF8.GetString(dict.BlobSpan(ep, defTagsLen));
             ep += defTagsLen;
 
-            byte rulesLen = dict.Blobs[ep++];
-            string rules = Encoding.UTF8.GetString(dict.Blobs, ep, rulesLen);
+            byte rulesLen = dict.BlobsPtr[ep++];
+            string rules = Encoding.UTF8.GetString(dict.BlobSpan(ep, rulesLen));
             ep += rulesLen;
 
-            byte termTagsLen = dict.Blobs[ep++];
-            string termTags = Encoding.UTF8.GetString(dict.Blobs, ep, termTagsLen);
+            byte termTagsLen = dict.BlobsPtr[ep++];
+            string termTags = Encoding.UTF8.GetString(dict.BlobSpan(ep, termTagsLen));
 
             var key = (cachedExpr, cachedReading!);
             if (!termMap.TryGetValue(key, out var term))
@@ -356,19 +374,19 @@ public sealed class DictionaryQuery : IDisposable
 
                 var frequencies = new List<Frequency>();
                 int pos = (int)offsetAddr;
-                uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(pos));
+                uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.BlobSpan(pos, 4));
                 pos += 4;
 
                 for (uint i = 0; i < count; i++)
                 {
-                    ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(pos));
+                    ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.BlobSpan(pos, 8));
                     pos += 8;
 
                     if (!TryReadMetaEntryHeader(dict, (int)entryOffset, exprBytes, "freq"u8, out int dataPos))
                         continue;
 
-                    uint dataLen = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(dataPos));
-                    var freqData = dict.Blobs.AsSpan(dataPos + 4, (int)dataLen);
+                    uint dataLen = BinaryPrimitives.ReadUInt32LittleEndian(dict.BlobSpan(dataPos, 4));
+                    var freqData = dict.BlobSpan(dataPos + 4, (int)dataLen);
 
                     if (TryParseFrequency(freqData, term.Reading, out var freq))
                         frequencies.Add(freq);
@@ -396,19 +414,19 @@ public sealed class DictionaryQuery : IDisposable
 
                 var pitchPositions = new List<int>();
                 int pos = (int)offsetAddr;
-                uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(pos));
+                uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.BlobSpan(pos, 4));
                 pos += 4;
 
                 for (uint i = 0; i < count; i++)
                 {
-                    ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(pos));
+                    ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.BlobSpan(pos, 8));
                     pos += 8;
 
                     if (!TryReadMetaEntryHeader(dict, (int)entryOffset, exprBytes, "pitch"u8, out int dataPos))
                         continue;
 
-                    uint dataLen = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(dataPos));
-                    var pitchData = dict.Blobs.AsSpan(dataPos + 4, (int)dataLen);
+                    uint dataLen = BinaryPrimitives.ReadUInt32LittleEndian(dict.BlobSpan(dataPos, 4));
+                    var pitchData = dict.BlobSpan(dataPos + 4, (int)dataLen);
 
                     if (TryParsePitch(pitchData, term.Reading, out var positions))
                         pitchPositions.AddRange(positions);
@@ -425,7 +443,7 @@ public sealed class DictionaryQuery : IDisposable
         ulong hash = dict.Phf.Lookup(exprBytes);
         if (hash >= (ulong)dict.Offsets.Length) { offsetAddr = 0; return false; }
         offsetAddr = dict.Offsets[hash];
-        return offsetAddr < (ulong)dict.Blobs.Length;
+        return offsetAddr < (ulong)dict.BlobsLength;
     }
 
     private static bool TryReadMetaEntryHeader(LoadedDict dict, int entryPos, ReadOnlySpan<byte> exprBytes,
@@ -433,16 +451,16 @@ public sealed class DictionaryQuery : IDisposable
     {
         dataPos = 0;
         int ep = entryPos;
-        byte type = dict.Blobs[ep++];
+        byte type = dict.BlobsPtr[ep++];
         if (type != 1) return false;
 
-        ushort exprLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.Blobs.AsSpan(ep));
+        ushort exprLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.BlobSpan(ep, 2));
         ep += 2;
-        if (!dict.Blobs.AsSpan(ep, exprLen).SequenceEqual(exprBytes)) return false;
+        if (!dict.BlobSpan(ep, exprLen).SequenceEqual(exprBytes)) return false;
         ep += exprLen;
 
-        byte modeLen = dict.Blobs[ep++];
-        if (!dict.Blobs.AsSpan(ep, modeLen).SequenceEqual(modeFilter)) return false;
+        byte modeLen = dict.BlobsPtr[ep++];
+        if (!dict.BlobSpan(ep, modeLen).SequenceEqual(modeFilter)) return false;
         ep += modeLen;
 
         dataPos = ep;
