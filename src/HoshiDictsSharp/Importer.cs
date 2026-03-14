@@ -4,13 +4,30 @@ using System.IO.Compression;
 using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text;
 using K4os.Compression.LZ4;
 
 namespace HoshiDictsSharp;
 
 public static class DictionaryImporter
 {
+    private readonly struct BankEntry(int dataOffset, int compressedSize, int uncompressedSize, ushort compressionMethod)
+    {
+        public readonly int DataOffset = dataOffset;
+        public readonly int CompressedSize = compressedSize;
+        public readonly int UncompressedSize = uncompressedSize;
+        public readonly ushort CompressionMethod = compressionMethod;
+    }
+
+    private readonly struct MediaEntry(int pathOffset, int pathLen, int dataOffset, int compressedSize, int uncompressedSize, ushort compressionMethod)
+    {
+        public readonly int PathOffset = pathOffset;
+        public readonly int PathLen = pathLen;
+        public readonly int DataOffset = dataOffset;
+        public readonly int CompressedSize = compressedSize;
+        public readonly int UncompressedSize = uncompressedSize;
+        public readonly ushort CompressionMethod = compressionMethod;
+    }
+
     private sealed class ProcessedFile
     {
         public byte[] Data = [];
@@ -87,37 +104,16 @@ public static class DictionaryImporter
         {
             byte[] zipBytes = File.ReadAllBytes(zipPath);
 
-            byte[] indexContent;
-            byte[] styles;
-            var termBankNames = new List<string>();
-            var metaBankNames = new List<string>();
-            var mediaInfos = new List<(string FullName, int Length)>();
+            byte[] indexContent = [];
+            byte[] styles = [];
+            var termBanks = new List<BankEntry>();
+            var metaBanks = new List<BankEntry>();
+            var mediaEntries = new List<MediaEntry>();
 
-            using (var zipStream = new MemoryStream(zipBytes, writable: false))
-            using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
-            {
-                indexContent = ReadEntry(archive, "index.json");
-                if (indexContent.Length == 0)
-                    throw new InvalidOperationException("could not find or read index.json");
+            ClassifyZipEntries(zipBytes, ref indexContent, ref styles, termBanks, metaBanks, mediaEntries);
 
-                styles = ReadEntry(archive, "styles.css");
-
-                foreach (var entry in archive.Entries)
-                {
-                    string name = entry.Name;
-                    if (entry.Length == 0 && string.IsNullOrEmpty(name))
-                        continue;
-
-                    if (name.StartsWith("term_bank_", StringComparison.Ordinal))
-                        termBankNames.Add(entry.FullName);
-                    else if (name.StartsWith("term_meta_bank_", StringComparison.Ordinal))
-                        metaBankNames.Add(entry.FullName);
-                    else if (name.StartsWith("tag_bank_", StringComparison.Ordinal))
-                        { }
-                    else if (name is not "styles.css" and not "index.json" && !string.IsNullOrEmpty(name) && entry.Length > 0)
-                        mediaInfos.Add((entry.FullName, (int)entry.Length));
-                }
-            }
+            if (indexContent.Length == 0)
+                throw new InvalidOperationException("could not find or read index.json");
 
             result.Title = YomitanParser.ParseIndexTitle(indexContent);
             if (string.IsNullOrEmpty(result.Title))
@@ -131,16 +127,16 @@ public static class DictionaryImporter
             if (styles.Length > 0)
                 File.WriteAllBytes(Path.Combine(dictPath, "styles.css"), styles);
 
-            Task? mediaTask = mediaInfos.Count > 0
-                ? Task.Run(() => WriteMedia(dictPath, mediaInfos, zipBytes, result))
+            Task? mediaTask = mediaEntries.Count > 0
+                ? Task.Run(() => WriteMedia(dictPath, mediaEntries, zipBytes, result))
                 : null;
 
             using var blobsStream = new FileStream(Path.Combine(dictPath, "blobs.bin"), FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
             var allFlatOffsets = new List<(ulong Hash, ulong GlobalOffset)>();
             ulong writeOffset = 0;
 
-            writeOffset = WriteTermBanks(blobsStream, allFlatOffsets, termBankNames, zipBytes, writeOffset, result);
-            writeOffset = WriteMetaBanks(blobsStream, allFlatOffsets, metaBankNames, zipBytes, writeOffset, result);
+            writeOffset = WriteTermBanks(blobsStream, allFlatOffsets, termBanks, zipBytes, writeOffset, result);
+            writeOffset = WriteMetaBanks(blobsStream, allFlatOffsets, metaBanks, zipBytes, writeOffset, result);
 
             if (allFlatOffsets.Count == 0)
                 throw new InvalidOperationException("empty dictionary");
@@ -230,16 +226,140 @@ public static class DictionaryImporter
         return result;
     }
 
-    private static byte[] ReadEntry(ZipArchive archive, string name)
+    private static void ClassifyZipEntries(byte[] zip, ref byte[] indexContent, ref byte[] styles,
+        List<BankEntry> termBanks, List<BankEntry> metaBanks, List<MediaEntry> mediaEntries)
     {
-        var entry = archive.GetEntry(name);
-        if (entry is null) return [];
+        int eocdOffset = -1;
+        for (int i = zip.Length - 22; i >= Math.Max(0, zip.Length - 65557); i--)
+        {
+            if (BinaryPrimitives.ReadUInt32LittleEndian(zip.AsSpan(i)) == 0x06054b50)
+            {
+                eocdOffset = i;
+                break;
+            }
+        }
+        if (eocdOffset < 0) throw new InvalidOperationException("invalid zip: EOCD not found");
 
-        int len = (int)entry.Length;
-        var buf = new byte[len];
-        using var stream = entry.Open();
-        ReadFully(stream, buf, len);
-        return buf;
+        long cdOffset = BinaryPrimitives.ReadUInt32LittleEndian(zip.AsSpan(eocdOffset + 16));
+        long cdEntryCount = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(eocdOffset + 10));
+
+        if (cdOffset == 0xFFFFFFFF || cdEntryCount == 0xFFFF)
+        {
+            int locatorOffset = eocdOffset - 20;
+            if (locatorOffset >= 0 && BinaryPrimitives.ReadUInt32LittleEndian(zip.AsSpan(locatorOffset)) == 0x07064b50)
+            {
+                long zip64EocdOffset = (long)BinaryPrimitives.ReadUInt64LittleEndian(zip.AsSpan(locatorOffset + 8));
+                cdEntryCount = (long)BinaryPrimitives.ReadUInt64LittleEndian(zip.AsSpan((int)zip64EocdOffset + 32));
+                cdOffset = (long)BinaryPrimitives.ReadUInt64LittleEndian(zip.AsSpan((int)zip64EocdOffset + 48));
+            }
+        }
+
+        int pos = (int)cdOffset;
+
+        for (long e = 0; e < cdEntryCount; e++)
+        {
+            ushort compressionMethod = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(pos + 10));
+            int compressedSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(zip.AsSpan(pos + 20));
+            int uncompressedSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(zip.AsSpan(pos + 24));
+            ushort nameLen = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(pos + 28));
+            ushort extraLen = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(pos + 30));
+            ushort commentLen = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(pos + 32));
+            long localHeaderOffset = BinaryPrimitives.ReadUInt32LittleEndian(zip.AsSpan(pos + 42));
+
+            if (IsZip64Sentinel(compressedSize) || IsZip64Sentinel(uncompressedSize) || localHeaderOffset == 0xFFFFFFFF)
+            {
+                ParseZip64Extra(zip.AsSpan(pos + 46 + nameLen, extraLen),
+                    ref uncompressedSize, ref compressedSize, ref localHeaderOffset);
+            }
+
+            int lhPos = (int)localHeaderOffset;
+            ushort localNameLen = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(lhPos + 26));
+            ushort localExtraLen = BinaryPrimitives.ReadUInt16LittleEndian(zip.AsSpan(lhPos + 28));
+            int dataOffset = lhPos + 30 + localNameLen + localExtraLen;
+
+            ReadOnlySpan<byte> fullNameBytes = zip.AsSpan(pos + 46, nameLen);
+            int lastSlash = fullNameBytes.LastIndexOf((byte)'/');
+            ReadOnlySpan<byte> fileName = lastSlash >= 0 ? fullNameBytes.Slice(lastSlash + 1) : fullNameBytes;
+
+            if (fileName.Length == 0 || uncompressedSize == 0)
+            {
+                pos += 46 + nameLen + extraLen + commentLen;
+                continue;
+            }
+
+            if (fileName.SequenceEqual("index.json"u8))
+            {
+                indexContent = ReadEntryDirect(zip, dataOffset, compressedSize, uncompressedSize, compressionMethod);
+            }
+            else if (fileName.SequenceEqual("styles.css"u8))
+            {
+                styles = ReadEntryDirect(zip, dataOffset, compressedSize, uncompressedSize, compressionMethod);
+            }
+            else if (fileName.StartsWith("term_bank_"u8))
+            {
+                termBanks.Add(new BankEntry(dataOffset, compressedSize, uncompressedSize, compressionMethod));
+            }
+            else if (fileName.StartsWith("term_meta_bank_"u8))
+            {
+                metaBanks.Add(new BankEntry(dataOffset, compressedSize, uncompressedSize, compressionMethod));
+            }
+            else if (!fileName.StartsWith("tag_bank_"u8))
+            {
+                mediaEntries.Add(new MediaEntry(pos + 46, nameLen, dataOffset, compressedSize, uncompressedSize, compressionMethod));
+            }
+
+            pos += 46 + nameLen + extraLen + commentLen;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsZip64Sentinel(int value) => value == unchecked((int)0xFFFFFFFF);
+
+    private static void ParseZip64Extra(ReadOnlySpan<byte> extra, ref int uncompressedSize, ref int compressedSize, ref long localHeaderOffset)
+    {
+        int ep = 0;
+        while (ep + 4 <= extra.Length)
+        {
+            ushort tag = BinaryPrimitives.ReadUInt16LittleEndian(extra.Slice(ep));
+            ushort size = BinaryPrimitives.ReadUInt16LittleEndian(extra.Slice(ep + 2));
+            if (tag == 0x0001)
+            {
+                int fp = ep + 4;
+                if (IsZip64Sentinel(uncompressedSize))
+                {
+                    uncompressedSize = (int)BinaryPrimitives.ReadUInt64LittleEndian(extra.Slice(fp));
+                    fp += 8;
+                }
+                if (IsZip64Sentinel(compressedSize))
+                {
+                    compressedSize = (int)BinaryPrimitives.ReadUInt64LittleEndian(extra.Slice(fp));
+                    fp += 8;
+                }
+                if (localHeaderOffset == 0xFFFFFFFF)
+                {
+                    localHeaderOffset = (long)BinaryPrimitives.ReadUInt64LittleEndian(extra.Slice(fp));
+                }
+                return;
+            }
+            ep += 4 + size;
+        }
+    }
+
+    private static byte[] ReadEntryDirect(byte[] zip, int dataOffset, int compressedSize, int uncompressedSize, ushort compressionMethod)
+    {
+        if (compressionMethod == 0)
+        {
+            var buf = new byte[uncompressedSize];
+            zip.AsSpan(dataOffset, uncompressedSize).CopyTo(buf);
+            return buf;
+        }
+
+        var result = new byte[uncompressedSize];
+        using var ds = new DeflateStream(
+            new MemoryStream(zip, dataOffset, compressedSize, writable: false),
+            CompressionMode.Decompress);
+        ReadFully(ds, result, uncompressedSize);
+        return result;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -401,29 +521,34 @@ public static class DictionaryImporter
     }
 
     private static ulong WriteTermBanks(FileStream file, List<(ulong Hash, ulong GlobalOffset)> allFlatOffsets,
-        List<string> entryNames, byte[] zipBytes, ulong writeOffset, ImportResult result)
+        List<BankEntry> banks, byte[] zipBytes, ulong writeOffset, ImportResult result)
     {
-        if (entryNames.Count == 0) return writeOffset;
+        if (banks.Count == 0) return writeOffset;
 
-        int threadCount = Math.Min(Environment.ProcessorCount, entryNames.Count);
-        var allProcessed = new ProcessedFile[entryNames.Count];
+        int threadCount = Math.Min(Environment.ProcessorCount, banks.Count);
+        var allProcessed = new ProcessedFile[banks.Count];
 
         Parallel.For(0, threadCount, t =>
         {
-            int chunkStart = entryNames.Count * t / threadCount;
-            int chunkEnd = entryNames.Count * (t + 1) / threadCount;
-
-            using var stream = new MemoryStream(zipBytes, writable: false);
-            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            int chunkStart = banks.Count * t / threadCount;
+            int chunkEnd = banks.Count * (t + 1) / threadCount;
 
             for (int i = chunkStart; i < chunkEnd; i++)
             {
-                var entry = archive.GetEntry(entryNames[i])!;
-                int len = (int)entry.Length;
-                byte[] buf = ArrayPool<byte>.Shared.Rent(len);
-                using (var es = entry.Open())
-                    ReadFully(es, buf, len);
-                allProcessed[i] = ProcessTermBank(buf, len);
+                var bank = banks[i];
+                byte[] buf = ArrayPool<byte>.Shared.Rent(bank.UncompressedSize);
+                if (bank.CompressionMethod == 0)
+                {
+                    zipBytes.AsSpan(bank.DataOffset, bank.UncompressedSize).CopyTo(buf);
+                }
+                else
+                {
+                    using var ds = new DeflateStream(
+                        new MemoryStream(zipBytes, bank.DataOffset, bank.CompressedSize, writable: false),
+                        CompressionMode.Decompress);
+                    ReadFully(ds, buf, bank.UncompressedSize);
+                }
+                allProcessed[i] = ProcessTermBank(buf, bank.UncompressedSize);
             }
         });
 
@@ -441,7 +566,10 @@ public static class DictionaryImporter
             totalFlatOffsets += p.FlatOffsets.Count;
         }
 
-        allFlatOffsets.EnsureCapacity(allFlatOffsets.Count + totalFlatOffsets);
+        int baseIdx = allFlatOffsets.Count;
+        CollectionsMarshal.SetCount(allFlatOffsets, baseIdx + totalFlatOffsets);
+        var allSpan = CollectionsMarshal.AsSpan(allFlatOffsets);
+        int writeIdx = baseIdx;
 
         Span<byte> headerBuf = stackalloc byte[8];
         BinaryPrimitives.WriteUInt64LittleEndian(headerBuf, totalCompressedSize);
@@ -476,7 +604,7 @@ public static class DictionaryImporter
             ulong dataBase = writeOffset;
             var flatOffsets = CollectionsMarshal.AsSpan(p.FlatOffsets);
             for (int j = 0; j < flatOffsets.Length; j++)
-                allFlatOffsets.Add((flatOffsets[j].Hash, flatOffsets[j].Offset + dataBase));
+                allSpan[writeIdx++] = (flatOffsets[j].Hash, flatOffsets[j].Offset + dataBase);
 
             writeOffset += (ulong)p.DataLength;
             result.TermCount += p.Count;
@@ -487,36 +615,45 @@ public static class DictionaryImporter
     }
 
     private static ulong WriteMetaBanks(FileStream file, List<(ulong Hash, ulong GlobalOffset)> allFlatOffsets,
-        List<string> entryNames, byte[] zipBytes, ulong writeOffset, ImportResult result)
+        List<BankEntry> banks, byte[] zipBytes, ulong writeOffset, ImportResult result)
     {
-        if (entryNames.Count == 0) return writeOffset;
+        if (banks.Count == 0) return writeOffset;
 
-        int threadCount = Math.Min(Environment.ProcessorCount, entryNames.Count);
-        var allProcessed = new ProcessedFile[entryNames.Count];
+        int threadCount = Math.Min(Environment.ProcessorCount, banks.Count);
+        var allProcessed = new ProcessedFile[banks.Count];
 
         Parallel.For(0, threadCount, t =>
         {
-            int chunkStart = entryNames.Count * t / threadCount;
-            int chunkEnd = entryNames.Count * (t + 1) / threadCount;
-
-            using var stream = new MemoryStream(zipBytes, writable: false);
-            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            int chunkStart = banks.Count * t / threadCount;
+            int chunkEnd = banks.Count * (t + 1) / threadCount;
 
             for (int i = chunkStart; i < chunkEnd; i++)
             {
-                var entry = archive.GetEntry(entryNames[i])!;
-                int len = (int)entry.Length;
-                byte[] buf = ArrayPool<byte>.Shared.Rent(len);
-                using (var es = entry.Open())
-                    ReadFully(es, buf, len);
-                allProcessed[i] = ProcessMetaBank(buf, len);
+                var bank = banks[i];
+                byte[] buf = ArrayPool<byte>.Shared.Rent(bank.UncompressedSize);
+                if (bank.CompressionMethod == 0)
+                {
+                    zipBytes.AsSpan(bank.DataOffset, bank.UncompressedSize).CopyTo(buf);
+                }
+                else
+                {
+                    using var ds = new DeflateStream(
+                        new MemoryStream(zipBytes, bank.DataOffset, bank.CompressedSize, writable: false),
+                        CompressionMode.Decompress);
+                    ReadFully(ds, buf, bank.UncompressedSize);
+                }
+                allProcessed[i] = ProcessMetaBank(buf, bank.UncompressedSize);
             }
         });
 
         int totalFlatOffsets = 0;
         for (int i = 0; i < allProcessed.Length; i++)
             totalFlatOffsets += allProcessed[i].FlatOffsets.Count;
-        allFlatOffsets.EnsureCapacity(allFlatOffsets.Count + totalFlatOffsets);
+
+        int baseIdx = allFlatOffsets.Count;
+        CollectionsMarshal.SetCount(allFlatOffsets, baseIdx + totalFlatOffsets);
+        var allSpan = CollectionsMarshal.AsSpan(allFlatOffsets);
+        int writeIdx = baseIdx;
 
         for (int i = 0; i < allProcessed.Length; i++)
         {
@@ -528,7 +665,7 @@ public static class DictionaryImporter
             ulong dataBase = writeOffset;
             var flatOffsets = CollectionsMarshal.AsSpan(p.FlatOffsets);
             for (int k = 0; k < flatOffsets.Length; k++)
-                allFlatOffsets.Add((flatOffsets[k].Hash, flatOffsets[k].Offset + dataBase));
+                allSpan[writeIdx++] = (flatOffsets[k].Hash, flatOffsets[k].Offset + dataBase);
 
             writeOffset += (ulong)p.DataLength;
             result.MetaCount += p.Count;
@@ -538,54 +675,40 @@ public static class DictionaryImporter
         return writeOffset;
     }
 
-    private static void WriteMedia(string dictPath, List<(string FullName, int Length)> mediaFiles, byte[] zipBytes, ImportResult result)
+    private static void WriteMedia(string dictPath, List<MediaEntry> mediaFiles, byte[] zipBytes, ImportResult result)
     {
         if (mediaFiles.Count == 0) return;
 
-        int threadCount = Math.Min(Environment.ProcessorCount, mediaFiles.Count);
-        var allBlobs = new (byte[] Blob, int Length, string Path)[mediaFiles.Count];
+        using var mediaStream = new FileStream(Path.Combine(dictPath, "media.bin"), FileMode.Create, FileAccess.Write, FileShare.None, 4 << 20);
+        Span<byte> hdr = stackalloc byte[6];
 
-        Parallel.For(0, threadCount, t =>
+        for (int i = 0; i < mediaFiles.Count; i++)
         {
-            int chunkStart = mediaFiles.Count * t / threadCount;
-            int chunkEnd = mediaFiles.Count * (t + 1) / threadCount;
+            var entry = mediaFiles[i];
 
-            using var stream = new MemoryStream(zipBytes, writable: false);
-            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            BinaryPrimitives.WriteUInt16LittleEndian(hdr, (ushort)entry.PathLen);
+            mediaStream.Write(hdr.Slice(0, 2));
+            mediaStream.Write(zipBytes.AsSpan(entry.PathOffset, entry.PathLen));
+            BinaryPrimitives.WriteUInt32LittleEndian(hdr, (uint)entry.UncompressedSize);
+            mediaStream.Write(hdr.Slice(0, 4));
 
-            for (int i = chunkStart; i < chunkEnd; i++)
+            if (entry.CompressionMethod == 0)
             {
-                var info = mediaFiles[i];
-                var entry = archive.GetEntry(info.FullName)!;
-                byte[] blob = ArrayPool<byte>.Shared.Rent(info.Length);
-                using var es = entry.Open();
-                ReadFully(es, blob, info.Length);
-                allBlobs[i] = (blob, info.Length, info.FullName);
+                mediaStream.Write(zipBytes.AsSpan(entry.DataOffset, entry.UncompressedSize));
             }
-        });
-
-        using var mediaStream = new FileStream(Path.Combine(dictPath, "media.bin"), FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
-        var pool = ArrayPool<byte>.Shared;
-        byte[] headerBuf = new byte[1024];
-
-        for (int i = 0; i < allBlobs.Length; i++)
-        {
-            var (blob, entryLen, path) = allBlobs[i];
-            int pathByteCount = Encoding.UTF8.GetByteCount(path);
-            int headerLen = 2 + pathByteCount + 4;
-            if (headerBuf.Length < headerLen)
-                headerBuf = new byte[headerLen * 2];
-
-            BinaryPrimitives.WriteUInt16LittleEndian(headerBuf, (ushort)pathByteCount);
-            Encoding.UTF8.GetBytes(path, headerBuf.AsSpan(2));
-            BinaryPrimitives.WriteUInt32LittleEndian(headerBuf.AsSpan(2 + pathByteCount), (uint)entryLen);
-
-            mediaStream.Write(headerBuf, 0, headerLen);
-            mediaStream.Write(blob, 0, entryLen);
-            pool.Return(blob);
+            else
+            {
+                byte[] buf = ArrayPool<byte>.Shared.Rent(entry.UncompressedSize);
+                using var ds = new DeflateStream(
+                    new MemoryStream(zipBytes, entry.DataOffset, entry.CompressedSize, writable: false),
+                    CompressionMode.Decompress);
+                ReadFully(ds, buf, entry.UncompressedSize);
+                mediaStream.Write(buf, 0, entry.UncompressedSize);
+                ArrayPool<byte>.Shared.Return(buf);
+            }
         }
 
-        result.MediaCount = allBlobs.Length;
+        result.MediaCount = mediaFiles.Count;
     }
 
     private static void RadixSortByHash(Span<(ulong Hash, ulong Offset)> data)
@@ -612,22 +735,36 @@ public static class DictionaryImporter
             for (int i = 0; i < src.Length; i++)
                 counts[(int)((src[i].Item1 >> shift) & 0xFF)]++;
 
-            int sum = 0;
             for (int i = 0; i < 256; i++)
             {
-                int c = counts[i];
-                counts[i] = sum;
-                sum += c;
+                if (counts[i] == src.Length)
+                    goto Skip;
             }
 
-            for (int i = 0; i < src.Length; i++)
             {
-                int bucket = (int)((src[i].Item1 >> shift) & 0xFF);
-                dst[counts[bucket]++] = src[i];
+                int sum = 0;
+                for (int i = 0; i < 256; i++)
+                {
+                    int c = counts[i];
+                    counts[i] = sum;
+                    sum += c;
+                }
+
+                for (int i = 0; i < src.Length; i++)
+                {
+                    int bucket = (int)((src[i].Item1 >> shift) & 0xFF);
+                    dst[counts[bucket]++] = src[i];
+                }
+
+                srcIsData = !srcIsData;
+                continue;
             }
 
-            srcIsData = !srcIsData;
+            Skip:;
         }
+
+        if (!srcIsData)
+            temp.Slice(0, data.Length).CopyTo(data);
 
         ArrayPool<(ulong, ulong)>.Shared.Return(tempArr);
     }
