@@ -174,6 +174,10 @@ public sealed class DictionaryQuery
         uint count = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(pos));
         pos += 4;
 
+        ulong prevPairHash = 0;
+        string? cachedExpr = null;
+        string? cachedReading = null;
+
         for (uint i = 0; i < count; i++)
         {
             ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(pos));
@@ -197,8 +201,13 @@ public sealed class DictionaryQuery
             if (!exprMatch && !readingSpan.SequenceEqual(exprBytes))
                 continue;
 
-            string expr = Encoding.UTF8.GetString(exprSpan);
-            string reading = Encoding.UTF8.GetString(readingSpan);
+            ulong pairHash = XxHash3.HashToUInt64(exprSpan) ^ (XxHash3.HashToUInt64(readingSpan) * 0x9E3779B97F4A7C15);
+            if (pairHash != prevPairHash || cachedExpr == null)
+            {
+                cachedExpr = Encoding.UTF8.GetString(exprSpan);
+                cachedReading = Encoding.UTF8.GetString(readingSpan);
+                prevPairHash = pairHash;
+            }
 
             ulong glossaryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(ep));
             ep += 8;
@@ -220,10 +229,10 @@ public sealed class DictionaryQuery
             byte termTagsLen = dict.Blobs[ep++];
             string termTags = Encoding.UTF8.GetString(dict.Blobs, ep, termTagsLen);
 
-            var key = (expr, reading);
+            var key = (cachedExpr, cachedReading!);
             if (!termMap.TryGetValue(key, out var term))
             {
-                term = new TermResult { Expression = expr, Reading = reading, Rules = rules };
+                term = new TermResult { Expression = cachedExpr, Reading = cachedReading!, Rules = rules };
                 termMap[key] = term;
             }
             else if (!string.IsNullOrEmpty(rules))
@@ -239,9 +248,13 @@ public sealed class DictionaryQuery
 
     public void QueryFreq(List<TermResult> terms)
     {
+        Span<byte> stackBuf = stackalloc byte[256];
         foreach (var term in terms)
         {
-            byte[] exprBytes = Encoding.UTF8.GetBytes(term.Expression);
+            int maxBytes = Encoding.UTF8.GetMaxByteCount(term.Expression.Length);
+            Span<byte> exprBuf = maxBytes <= 256 ? stackBuf : new byte[maxBytes];
+            int bytesWritten = Encoding.UTF8.GetBytes(term.Expression.AsSpan(), exprBuf);
+            var exprBytes = exprBuf[..bytesWritten];
 
             foreach (var dict in _freqDicts)
             {
@@ -257,7 +270,7 @@ public sealed class DictionaryQuery
                     ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(pos));
                     pos += 8;
 
-                    if (!TryReadMetaEntryHeader(dict, (int)entryOffset, term.Expression, "freq"u8, out int dataPos))
+                    if (!TryReadMetaEntryHeader(dict, (int)entryOffset, exprBytes, "freq"u8, out int dataPos))
                         continue;
 
                     uint dataLen = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(dataPos));
@@ -275,9 +288,13 @@ public sealed class DictionaryQuery
 
     public void QueryPitch(List<TermResult> terms)
     {
+        Span<byte> stackBuf = stackalloc byte[256];
         foreach (var term in terms)
         {
-            byte[] exprBytes = Encoding.UTF8.GetBytes(term.Expression);
+            int maxBytes = Encoding.UTF8.GetMaxByteCount(term.Expression.Length);
+            Span<byte> exprBuf = maxBytes <= 256 ? stackBuf : new byte[maxBytes];
+            int bytesWritten = Encoding.UTF8.GetBytes(term.Expression.AsSpan(), exprBuf);
+            var exprBytes = exprBuf[..bytesWritten];
 
             foreach (var dict in _pitchDicts)
             {
@@ -293,7 +310,7 @@ public sealed class DictionaryQuery
                     ulong entryOffset = BinaryPrimitives.ReadUInt64LittleEndian(dict.Blobs.AsSpan(pos));
                     pos += 8;
 
-                    if (!TryReadMetaEntryHeader(dict, (int)entryOffset, term.Expression, "pitch"u8, out int dataPos))
+                    if (!TryReadMetaEntryHeader(dict, (int)entryOffset, exprBytes, "pitch"u8, out int dataPos))
                         continue;
 
                     uint dataLen = BinaryPrimitives.ReadUInt32LittleEndian(dict.Blobs.AsSpan(dataPos));
@@ -309,7 +326,7 @@ public sealed class DictionaryQuery
         }
     }
 
-    private static bool TryLookupOffsetAddr(LoadedDict dict, byte[] exprBytes, out ulong offsetAddr)
+    private static bool TryLookupOffsetAddr(LoadedDict dict, ReadOnlySpan<byte> exprBytes, out ulong offsetAddr)
     {
         ulong hash = dict.Phf.Lookup(exprBytes);
         if (hash >= (ulong)dict.Offsets.Length) { offsetAddr = 0; return false; }
@@ -317,7 +334,7 @@ public sealed class DictionaryQuery
         return offsetAddr < (ulong)dict.Blobs.Length;
     }
 
-    private static bool TryReadMetaEntryHeader(LoadedDict dict, int entryPos, string expression,
+    private static bool TryReadMetaEntryHeader(LoadedDict dict, int entryPos, ReadOnlySpan<byte> exprBytes,
         ReadOnlySpan<byte> modeFilter, out int dataPos)
     {
         dataPos = 0;
@@ -327,9 +344,8 @@ public sealed class DictionaryQuery
 
         ushort exprLen = BinaryPrimitives.ReadUInt16LittleEndian(dict.Blobs.AsSpan(ep));
         ep += 2;
-        string expr = Encoding.UTF8.GetString(dict.Blobs, ep, exprLen);
+        if (!dict.Blobs.AsSpan(ep, exprLen).SequenceEqual(exprBytes)) return false;
         ep += exprLen;
-        if (expr != expression) return false;
 
         byte modeLen = dict.Blobs[ep++];
         if (!dict.Blobs.AsSpan(ep, modeLen).SequenceEqual(modeFilter)) return false;

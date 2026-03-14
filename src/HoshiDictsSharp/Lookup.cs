@@ -6,7 +6,7 @@ public sealed class LookupResult
 {
     public string Matched = "";
     public string Deinflected = "";
-    public List<string> Process = [];
+    public IReadOnlyList<string> Process = [];
     public TermResult Term = new();
     public int PreprocessorSteps;
     public int MatchedTextLen;
@@ -27,20 +27,39 @@ public sealed class LookupEngine
     {
         var resultMap = new Dictionary<(string, string), LookupResult>();
 
-        int textLen = new StringInfo(lookupString).LengthInTextElements;
-        int start = Math.Min(scanLength, textLen);
+        bool needsGraphemeClustering = false;
+        for (int ci = 0; ci < lookupString.Length; ci++)
+        {
+            if (char.IsHighSurrogate(lookupString[ci]))
+            { needsGraphemeClustering = true; break; }
+        }
 
-        var enumerator = StringInfo.GetTextElementEnumerator(lookupString);
-        var positions = new List<int>(start + 1);
-        positions.Add(0);
-        while (enumerator.MoveNext())
-            positions.Add(enumerator.ElementIndex + enumerator.GetTextElement().Length);
+        int textLen;
+        int[] positions;
+        if (needsGraphemeClustering)
+        {
+            textLen = new StringInfo(lookupString).LengthInTextElements;
+            var enumerator = StringInfo.GetTextElementEnumerator(lookupString);
+            var posList = new List<int>(textLen + 1) { 0 };
+            while (enumerator.MoveNext())
+                posList.Add(enumerator.ElementIndex + enumerator.GetTextElement().Length);
+            positions = [.. posList];
+        }
+        else
+        {
+            textLen = lookupString.Length;
+            positions = new int[textLen + 1];
+            for (int ci = 0; ci <= textLen; ci++)
+                positions[ci] = ci;
+        }
+
+        int start = Math.Min(scanLength, textLen);
 
         var deduplicated = new Dictionary<(string, string), DeconjugationForm>();
 
         for (int i = start; i > 0; i--)
         {
-            if (i >= positions.Count) continue;
+            if (i >= positions.Length) continue;
             string searchStr = lookupString[..positions[i]];
             int searchStrTextLen = i;
 
@@ -73,7 +92,7 @@ public sealed class LookupEngine
                             {
                                 Matched = searchStr,
                                 Deinflected = form.Text,
-                                Process = form.Process.ToList(),
+                                Process = form.Process,
                                 Term = term,
                                 PreprocessorSteps = variant.Steps,
                                 MatchedTextLen = searchStrTextLen

@@ -596,7 +596,8 @@ public static class DictionaryImporter
             return;
         }
 
-        var temp = new (ulong Hash, ulong Offset)[data.Length];
+        var tempArr = ArrayPool<(ulong, ulong)>.Shared.Rent(data.Length);
+        var temp = tempArr.AsSpan(0, data.Length);
         Span<int> counts = stackalloc int[256];
         bool srcIsData = true;
 
@@ -605,11 +606,11 @@ public static class DictionaryImporter
             int shift = pass * 8;
             counts.Clear();
 
-            var src = srcIsData ? data : temp.AsSpan();
-            var dst = srcIsData ? temp.AsSpan() : data;
+            var src = srcIsData ? data : temp;
+            var dst = srcIsData ? temp : data;
 
             for (int i = 0; i < src.Length; i++)
-                counts[(int)((src[i].Hash >> shift) & 0xFF)]++;
+                counts[(int)((src[i].Item1 >> shift) & 0xFF)]++;
 
             int sum = 0;
             for (int i = 0; i < 256; i++)
@@ -621,12 +622,14 @@ public static class DictionaryImporter
 
             for (int i = 0; i < src.Length; i++)
             {
-                int bucket = (int)((src[i].Hash >> shift) & 0xFF);
+                int bucket = (int)((src[i].Item1 >> shift) & 0xFF);
                 dst[counts[bucket]++] = src[i];
             }
 
             srcIsData = !srcIsData;
         }
+
+        ArrayPool<(ulong, ulong)>.Shared.Return(tempArr);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
